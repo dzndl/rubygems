@@ -4,39 +4,33 @@ require 'rubygems/request'
 require 'rubygems/request/connection_pools'
 require 'rubygems/s3_uri_signer'
 require 'rubygems/uri_formatter'
-require 'rubygems/uri_parsing'
+require 'rubygems/uri_parser'
 require 'rubygems/user_interaction'
 require 'resolv'
-require 'rubygems/deprecate'
 
 ##
 # RemoteFetcher handles the details of fetching gems and gem information from
 # a remote source.
 
 class Gem::RemoteFetcher
-
   include Gem::UserInteraction
-  extend Gem::Deprecate
-
-  include Gem::UriParsing
 
   ##
   # A FetchError exception wraps up the various possible IO and HTTP failures
   # that could happen while downloading from the internet.
 
   class FetchError < Gem::Exception
-
-    include Gem::UriParsing
-
     ##
     # The URI which was being accessed when the exception happened.
 
-    attr_accessor :uri
+    attr_accessor :uri, :original_uri
 
     def initialize(message, uri)
       super message
 
-      uri = parse_uri(uri)
+      uri = Gem::UriParser.parse_uri(uri)
+
+      @original_uri = uri.dup
 
       uri.password = 'REDACTED' if uri.respond_to?(:password) && uri.password
 
@@ -46,7 +40,6 @@ class Gem::RemoteFetcher
     def to_s # :nodoc:
       "#{super} (#{uri})"
     end
-
   end
 
   ##
@@ -55,6 +48,7 @@ class Gem::RemoteFetcher
 
   class UnknownHostError < FetchError
   end
+  deprecate_constant(:UnknownHostError)
 
   @fetcher = nil
 
@@ -82,16 +76,16 @@ class Gem::RemoteFetcher
   #            fetching the gem.
 
   def initialize(proxy=nil, dns=nil, headers={})
+    require 'rubygems/core_ext/tcpsocket_init' if Gem.configuration.ipv4_fallback_enabled
     require 'net/http'
     require 'stringio'
-    require 'time'
     require 'uri'
 
     Socket.do_not_reverse_lookup = true
 
     @proxy = proxy
     @pools = {}
-    @pool_lock = Mutex.new
+    @pool_lock = Thread::Mutex.new
     @cert_files = Gem::Request.get_cert_files
 
     @headers = headers
@@ -109,7 +103,7 @@ class Gem::RemoteFetcher
 
     return if found.empty?
 
-    spec, source = found.max_by { |(s,_)| s.version }
+    spec, source = found.max_by {|(s,_)| s.version }
 
     download spec, source.uri
   end
@@ -120,11 +114,12 @@ class Gem::RemoteFetcher
   # always replaced.
 
   def download(spec, source_uri, install_dir = Gem.dir)
+    install_cache_dir = File.join install_dir, "cache"
     cache_dir =
-      if Dir.pwd == install_dir  # see fetch_command
+      if Dir.pwd == install_dir # see fetch_command
         install_dir
-      elsif File.writable? install_dir
-        File.join install_dir, "cache"
+      elsif File.writable?(install_cache_dir) || (File.writable?(install_dir) && (not File.exist?(install_cache_dir)))
+        install_cache_dir
       else
         File.join Gem.user_dir, "cache"
       end
@@ -132,9 +127,10 @@ class Gem::RemoteFetcher
     gem_file_name = File.basename spec.cache_file
     local_gem_path = File.join cache_dir, gem_file_name
 
+    require "fileutils"
     FileUtils.mkdir_p cache_dir rescue nil unless File.exist? cache_dir
 
-    source_uri = parse_uri(source_uri)
+    source_uri = Gem::UriParser.parse_uri(source_uri)
 
     scheme = source_uri.scheme
 
@@ -215,12 +211,12 @@ class Gem::RemoteFetcher
   def fetch_http(uri, last_modified = nil, head = false, depth = 0)
     fetch_type = head ? Net::HTTP::Head : Net::HTTP::Get
     response   = request uri, fetch_type, last_modified do |req|
-      headers.each { |k,v| req.add_field(k,v) }
+      headers.each {|k,v| req.add_field(k,v) }
     end
 
     case response
     when Net::HTTPOK, Net::HTTPNotModified then
-      response.uri = uri if response.respond_to? :uri
+      response.uri = uri
       head ? response : response.body
     when Net::HTTPMovedPermanently, Net::HTTPFound, Net::HTTPSeeOther,
          Net::HTTPTemporaryRedirect then
@@ -229,7 +225,7 @@ class Gem::RemoteFetcher
       unless location = response['Location']
         raise FetchError.new("redirecting but no redirect location was given", uri)
       end
-      location = parse_uri location
+      location = Gem::UriParser.parse_uri location
 
       if https?(uri) && !https?(location)
         raise FetchError.new("redirecting to non-https resource: #{location}", uri)
@@ -247,7 +243,7 @@ class Gem::RemoteFetcher
   # Downloads +uri+ and returns it as a String.
 
   def fetch_path(uri, mtime = nil, head = false)
-    uri = parse_uri uri
+    uri = Gem::UriParser.parse_uri uri
 
     unless uri.scheme
       raise ArgumentError, "uri scheme is invalid: #{uri.scheme.inspect}"
@@ -255,7 +251,7 @@ class Gem::RemoteFetcher
 
     data = send "fetch_#{uri.scheme}", uri, mtime, head
 
-    if data and !head and uri.to_s =~ /\.gz$/
+    if data and !head and uri.to_s.end_with?(".gz")
       begin
         data = Gem::Util.gunzip data
       rescue Zlib::GzipFile::Error
@@ -264,15 +260,9 @@ class Gem::RemoteFetcher
     end
 
     data
-  rescue Timeout::Error
-    raise UnknownHostError.new('timed out', uri)
-  rescue IOError, SocketError, SystemCallError,
-         *(OpenSSL::SSL::SSLError if defined?(OpenSSL)) => e
-    if e.message =~ /getaddrinfo/
-      raise UnknownHostError.new('no such name', uri)
-    else
-      raise FetchError.new("#{e.class}: #{e}", uri)
-    end
+  rescue Timeout::Error, IOError, SocketError, SystemCallError,
+         *(OpenSSL::SSL::SSLError if Gem::HAVE_OPENSSL) => e
+    raise FetchError.new("#{e.class}: #{e}", uri)
   end
 
   def fetch_s3(uri, mtime = nil, head = false)
@@ -298,7 +288,7 @@ class Gem::RemoteFetcher
 
     data = fetch_path(uri, mtime)
 
-    if data == nil # indicates the server returned 304 Not Modified
+    if data.nil? # indicates the server returned 304 Not Modified
       return Gem.read_binary(path)
     end
 
@@ -308,17 +298,6 @@ class Gem::RemoteFetcher
 
     data
   end
-
-  ##
-  # Returns the size of +uri+ in bytes.
-
-  def fetch_size(uri)
-    response = fetch_path(uri, nil, true)
-
-    response['content-length'].to_i
-  end
-
-  deprecate :fetch_size, :none, 2019, 12
 
   ##
   # Performs a Net::HTTP request of type +request_class+ on +uri+ returning
@@ -341,7 +320,7 @@ class Gem::RemoteFetcher
   end
 
   def close_all
-    @pools.each_value {|pool| pool.close_all}
+    @pools.each_value {|pool| pool.close_all }
   end
 
   private
@@ -355,5 +334,4 @@ class Gem::RemoteFetcher
       @pools[proxy] ||= Gem::Request::ConnectionPools.new proxy, @cert_files
     end
   end
-
 end
